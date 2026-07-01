@@ -1,7 +1,7 @@
 import os
 import anthropic
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -24,16 +24,23 @@ SYSTEM_PROMPT = """Tu es un assistant de calcul de comptes. Règles :
 - 1p jaune = 100 jaune / 1p filtre = 100f
 - Comptes séparés : Pipo, Cham, G, Appart, Livreur"""
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot prêt ✅")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = update.message.text
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}]
-    )
-    await update.message.reply_text(response.content[0].text)
+    try:
+        user_message = update.message.text
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}]
+        )
+        await update.message.reply_text(response.content[0].text)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur: {str(e)}")
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 app.run_polling()
