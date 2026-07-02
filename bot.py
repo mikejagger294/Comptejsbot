@@ -1,5 +1,6 @@
 import os
 import io
+import asyncio
 import contextlib
 import anthropic
 from telegram import Update
@@ -8,15 +9,18 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
+ADMIN_CHAT_ID = 7682373961
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 conversation_history = {}
+user_names = {}
 
-SYSTEM_PROMPT = """Tu es un assistant de calcul de comptes de stock et d'argent. Tu suis ces regles EXACTEMENT.
+BASE_PROMPT = """Tu es un assistant de calcul de comptes de stock et d'argent. Tu suis ces regles EXACTEMENT.
 
 === OUTIL PYTHON OBLIGATOIRE ===
 Pour TOUT calcul, tu DOIS utiliser l'outil python_calc. Ne calcule JAMAIS de tete.
-Ecris le code Python qui calcule chaque categorie (argent cumul, zip, jaune, etc.) et affiche les resultats avec print.
+Ecris le code Python qui calcule chaque categorie et affiche les resultats avec print.
 Utilise le resultat de l'outil pour construire ta reponse finale.
 
 === FORMAT DE REPONSE ===
@@ -31,10 +35,10 @@ Exemple de reponse finale (bloc code):
 27 zip
 8 jaune
 
-Si l'utilisateur demande detail, verifie ou detail zip, montrer le calcul ligne par ligne (toujours calcule via python_calc).
+Si l'utilisateur demande detail, verifie ou detail zip, montrer le calcul ligne par ligne (via python_calc).
 
 === QUESTIONS AVANT CALCUL ===
-Si probleme detecte, poser les questions AVANT de calculer (jamais apres):
+Si probleme detecte, poser les questions AVANT de calculer:
 - Unite inconnue
 - Prix manquant et pas clairement cred
 - Ligne ambigue ou nombre sans contexte
@@ -69,6 +73,17 @@ Pipo, Cham, G, Appart, Livreur
 === ORDRE FINAL ===
 Argent, Zip, Jaune, F, Cali, Amz/Amzz/Az, Kt, Md, Taz, Dose, Oliv, Kdo, Autres"""
 
+# Restriction ajoutee uniquement pour les utilisateurs (pas admin)
+RESTRICTION_USER = """
+
+=== RESTRICTION IMPORTANTE ===
+Tu ne calcules JAMAIS de benefice, marge, prix d'achat, prix de revient, ou rentabilite.
+Si on te demande ce type de calcul, reponds uniquement : "Non disponible."
+Tu fais uniquement les calculs de stock et d'argent des ventes."""
+
+SYSTEM_PROMPT_ADMIN = BASE_PROMPT
+SYSTEM_PROMPT_USER = BASE_PROMPT + RESTRICTION_USER
+
 TOOLS = [
     {
         "name": "python_calc",
@@ -76,10 +91,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Le code Python a executer"
-                }
+                "code": {"type": "string", "description": "Le code Python a executer"}
             },
             "required": ["code"]
         }
@@ -95,6 +107,24 @@ def run_python(code):
     except Exception as e:
         return f"Erreur Python: {str(e)}"
 
+async def notify_admin(context, user, user_msg, bot_reply):
+    if ADMIN_CHAT_ID == 0 or user.id == ADMIN_CHAT_ID:
+        return
+    try:
+        nom = user.first_name or "?"
+        username = f"@{user.username}" if user.username else "sans username"
+        texte = f"👤 {nom} ({username}) [id:{user.id}]\n\n📩 {user_msg}\n\n🤖 {bot_reply}"
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=texte)
+    except Exception:
+        pass
+
+async def auto_delete(context, chat_id, message_id):
+    await asyncio.sleep(43200)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     conversation_history[chat_id] = []
@@ -105,32 +135,52 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history[chat_id] = []
     await update.message.reply_text("Conversation reinitialisee")
 
+async def effacer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_CHAT_ID:
+        return
+    try:
+        cible = int(context.args[0])
+        conversation_history[cible] = []
+        await update.message.reply_text(f"Memoire de {cible} effacee")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /effacer [numero]")
+
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_CHAT_ID:
+        return
+    if not user_names:
+        await update.message.reply_text("Aucun utilisateur")
+        return
+    lignes = [f"{uid} : {nom}" for uid, nom in user_names.items()]
+    await update.message.reply_text("Utilisateurs:\n" + "\n".join(lignes))
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = update.message.chat_id
+        user = update.message.from_user
         user_message = update.message.text
+        user_names[user.id] = user.first_name or "?"
+
+        # Choix du prompt selon admin ou utilisateur
+        if user.id == ADMIN_CHAT_ID:
+            prompt = SYSTEM_PROMPT_ADMIN
+        else:
+            prompt = SYSTEM_PROMPT_USER
 
         if chat_id not in conversation_history:
             conversation_history[chat_id] = []
 
-        conversation_history[chat_id].append({
-            "role": "user",
-            "content": user_message
-        })
+        conversation_history[chat_id].append({"role": "user", "content": user_message})
 
         while True:
             response = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=3000,
-                system=SYSTEM_PROMPT,
+                system=prompt,
                 tools=TOOLS,
                 messages=conversation_history[chat_id]
             )
-
-            conversation_history[chat_id].append({
-                "role": "assistant",
-                "content": response.content
-            })
+            conversation_history[chat_id].append({"role": "assistant", "content": response.content})
 
             if response.stop_reason == "tool_use":
                 tool_results = []
@@ -142,16 +192,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "tool_use_id": block.id,
                             "content": result
                         })
-                conversation_history[chat_id].append({
-                    "role": "user",
-                    "content": tool_results
-                })
+                conversation_history[chat_id].append({"role": "user", "content": tool_results})
             else:
                 final_text = ""
                 for block in response.content:
                     if block.type == "text":
                         final_text += block.text
-                await update.message.reply_text(final_text)
+                sent = await update.message.reply_text(final_text)
+                await notify_admin(context, user, user_message, final_text)
+                if user.id != ADMIN_CHAT_ID:
+                    asyncio.create_task(auto_delete(context, chat_id, sent.message_id))
                 break
 
         if len(conversation_history[chat_id]) > 60:
@@ -163,5 +213,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("reset", reset))
+app.add_handler(CommandHandler("effacer", effacer))
+app.add_handler(CommandHandler("users", users))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 app.run_polling()
