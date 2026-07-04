@@ -73,7 +73,6 @@ Pipo, Cham, G, Appart, Livreur
 === ORDRE FINAL ===
 Argent, Zip, Jaune, F, Cali, Amz/Amzz/Az, Kt, Md, Taz, Dose, Oliv, Kdo, Autres"""
 
-# Restriction ajoutee uniquement pour les utilisateurs (pas admin)
 RESTRICTION_USER = """
 
 === RESTRICTION IMPORTANTE ===
@@ -106,6 +105,28 @@ def run_python(code):
         return output.getvalue()
     except Exception as e:
         return f"Erreur Python: {str(e)}"
+
+def trim_history(history, max_len=60):
+    # Coupe l'historique sans casser les paires tool_use/tool_result
+    if len(history) <= max_len:
+        return history
+    # On garde les derniers messages mais on demarre toujours sur un message user "normal"
+    trimmed = history[-max_len:]
+    while trimmed and trimmed[0]["role"] != "user":
+        trimmed = trimmed[1:]
+    # Verifie que le premier message user ne contient pas un tool_result orphelin
+    while trimmed:
+        first = trimmed[0]
+        content = first.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            trimmed = trimmed[1:]
+            while trimmed and trimmed[0]["role"] != "user":
+                trimmed = trimmed[1:]
+        else:
+            break
+    return trimmed
 
 async def notify_admin(context, user, user_msg, bot_reply):
     if ADMIN_CHAT_ID == 0 or user.id == ADMIN_CHAT_ID:
@@ -155,23 +176,22 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Utilisateurs:\n" + "\n".join(lignes))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    user = update.message.from_user
+    user_message = update.message.text
+    user_names[user.id] = user.first_name or "?"
+
+    if user.id == ADMIN_CHAT_ID:
+        prompt = SYSTEM_PROMPT_ADMIN
+    else:
+        prompt = SYSTEM_PROMPT_USER
+
+    if chat_id not in conversation_history:
+        conversation_history[chat_id] = []
+
+    conversation_history[chat_id].append({"role": "user", "content": user_message})
+
     try:
-        chat_id = update.message.chat_id
-        user = update.message.from_user
-        user_message = update.message.text
-        user_names[user.id] = user.first_name or "?"
-
-        # Choix du prompt selon admin ou utilisateur
-        if user.id == ADMIN_CHAT_ID:
-            prompt = SYSTEM_PROMPT_ADMIN
-        else:
-            prompt = SYSTEM_PROMPT_USER
-
-        if chat_id not in conversation_history:
-            conversation_history[chat_id] = []
-
-        conversation_history[chat_id].append({"role": "user", "content": user_message})
-
         while True:
             response = client.messages.create(
                 model="claude-sonnet-4-6",
@@ -204,11 +224,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     asyncio.create_task(auto_delete(context, chat_id, sent.message_id))
                 break
 
-        if len(conversation_history[chat_id]) > 60:
-            conversation_history[chat_id] = conversation_history[chat_id][-60:]
+        conversation_history[chat_id] = trim_history(conversation_history[chat_id])
 
     except Exception as e:
-        await update.message.reply_text(f"Erreur: {str(e)}")
+        # En cas d'erreur, on nettoie la memoire pour repartir sain
+        conversation_history[chat_id] = []
+        await update.message.reply_text(f"Erreur (memoire reinitialisee): {str(e)}")
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
